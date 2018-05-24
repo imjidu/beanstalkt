@@ -78,9 +78,14 @@ class Client(object):
         self._reconnect_cb = None
 
     def _reconnect(self):
+        def cb(future):
+            future.result()
+            self._reconnect()
+
         # wait some time before trying to re-connect
         self.io_loop.add_timeout(time.time() + RECONNECT_TIMEOUT,
-                lambda: self.connect(self._reconnected))
+                                 lambda: self.io_loop.add_future(
+                                     self.connect(), cb))
 
     def _reconnected(self):
         # re-establish the used tube and tubes being watched
