@@ -22,10 +22,11 @@ __version__ = '0.7.0'
 
 import socket
 import time
+import logging
 
 from collections import deque
 
-from tornado.gen import coroutine, Task, Return, Wait, Callback
+from tornado.gen import coroutine, Task, Return, Wait, Callback, multi
 from tornado.ioloop import IOLoop
 from tornado.iostream import IOStream
 from tornado import stack_context
@@ -36,6 +37,8 @@ from tornado.util import ObjectDict
 DEFAULT_PRIORITY = 2 ** 31
 DEFAULT_TTR = 120  # Time (in seconds) To Run a job, min. 1 sec.
 RECONNECT_TIMEOUT = 1  # Time (in seconds) between re-connection attempts
+
+logger = logging.getLogger('beanstalkt')
 
 
 class Bunch:
@@ -78,9 +81,11 @@ class Client(object):
         self._reconnect_cb = None
 
     def _reconnect(self):
+        logger.debug('Reconnect in %f second(s)', RECONNECT_TIMEOUT)
+
         def cb(future):
             future.result()
-            self._reconnect()
+            self._reconnected()
 
         # wait some time before trying to re-connect
         self.io_loop.add_timeout(time.time() + RECONNECT_TIMEOUT,
@@ -88,28 +93,31 @@ class Client(object):
                                      self.connect(), cb))
 
     def _reconnected(self):
+        logger.debug('Reconnected, restoring connection state...')
+
         # re-establish the used tube and tubes being watched
         watch = self._watching.difference(['default'])
         # ignore "default", if it is not in the client's watch list
         ignore = set(['default']).difference(self._watching)
 
-        def do_next(_=None):
-            try:
-                if watch:
-                    self.watch(watch.pop(), do_next)
-                elif ignore:
-                    self.ignore(ignore.pop(), do_next)
-                elif self._using != 'default':
-                    # change the tube used, and callback to user
-                    self.use(self._using, self._reconnect_cb)
-                elif self._reconnect_cb:
-                    # callback to user
-                    self._reconnect_cb()
-            except:
-                # ignored, as next re-connect will retry the operation
-                pass
+        futures = []
+        if watch:
+            futures.append(self.watch(watch.pop()))
+        if ignore:
+            futures.append(self.ignore(ignore.pop()))
+        if self._using != 'default':
+            futures.append(self.use(self._using))
 
-        do_next()
+        if futures:
+            def do_next(_=None):
+                if self._reconnect_cb:
+                    self._reconnect_cb()
+                self.io_loop.add_callback(self._process_queue)
+
+            future = multi(futures)
+            self.io_loop.add_future(future, do_next)
+        else:
+            self.io_loop.add_callback(self._process_queue)
 
     @coroutine
     def connect(self):
@@ -151,11 +159,14 @@ class Client(object):
         """"Returns True if the connection is closed."""
         return not self._stream or self._stream.closed()
 
-    def _interact(self, request, callback):
+    def _interact(self, request, callback, prior=False):
         # put the interaction request into the FIFO queue
         cb = stack_context.wrap(callback)
-        self._queue.append((request, cb))
-        self._process_queue()
+        if property:
+            self._queue.appendleft((request, cb))
+        else:
+            self._queue.append((request, cb))
+        self.io_loop.spawn_callback(self._process_queue)
 
     def _process_queue(self):
         if self._talking or not self._queue:
@@ -163,17 +174,25 @@ class Client(object):
         # pop a request of the queue and perform the send-receive interaction
         self._talking = True
         with stack_context.NullContext():
-            req, cb = self._queue.popleft()
+            req, cb = self._queue[0]
             command = req.cmd + b'\r\n'
             if req.body:
                 command += req.body + b'\r\n'
 
+            # when a line has been read: remove request from queue and
+            # return status and results
+            def read_cb(data):
+                logger.debug('Read response: %r', data)
+                self._recv(req, data, cb)
+                self.io_loop.add_callback(self._process_queue)
+
+            # when command is written: read line from socket stream
+            def write_cb():
+                self._stream.read_until(b'\r\n', read_cb)
+
             # write command and body to socket stream
-            self._stream.write(command,
-                    # when command is written: read line from socket stream
-                    lambda: self._stream.read_until(b'\r\n',
-                    # when a line has been read: return status and results
-                    lambda data: self._recv(req, data, cb)))
+            logger.debug('Write command: %r', command)
+            self._stream.write(command, write_cb)
 
     def _recv(self, req, data, cb):
         # parse the data received as server response
@@ -213,6 +232,7 @@ class Client(object):
                     lambda data: self._recv_body(data[:-2], resp, cb))
 
     def _recv_body(self, data, resp, cb):
+        logger.debug('Read body: %r', data)
         if resp.req.parse_yaml:
             # parse the yaml encoded body
             self._parse_yaml(data, resp, cb)
@@ -240,6 +260,7 @@ class Client(object):
     def _do_callback(self, cb, resp):
         # end the request and process next item in the queue
         # and callback with results
+        self._queue.popleft()
         self._talking = False
         self.io_loop.add_callback(self._process_queue)
 
@@ -302,7 +323,7 @@ class Client(object):
         cmd = 'use {}'.format(name).encode('utf8')
         request = Bunch(cmd=cmd, ok=['USING'],
                 read_value=True)
-        resp = yield Task(self._interact, request)
+        resp = yield Task(self._interact, request, prior=True)
         if not isinstance(resp, Exception):
             self._using = resp
         raise Return(resp)
@@ -409,7 +430,7 @@ class Client(object):
         """
         cmd = 'watch {}'.format(name).encode('utf8')
         request = Bunch(cmd=cmd, ok=['WATCHING'], read_value=True)
-        resp = yield Task(self._interact, request)
+        resp = yield Task(self._interact, request, prior=True)
         # add to the client's watch list
         self._watching.add(name)
         raise Return(resp)
@@ -425,7 +446,7 @@ class Client(object):
         cmd = 'ignore {}'.format(name).encode('utf8')
         request = Bunch(cmd=cmd, ok=['WATCHING'], err=['NOT_IGNORED'],
                 read_value=True)
-        resp = yield Task(self._interact, request)
+        resp = yield Task(self._interact, request, prior=True)
         if name in self._watching:
             # remove from the client's watch list
             self._watching.remove(name)
