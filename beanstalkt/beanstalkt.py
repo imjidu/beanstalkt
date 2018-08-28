@@ -162,7 +162,7 @@ class Client(object):
     def _interact(self, request, callback, prior=False):
         # put the interaction request into the FIFO queue
         cb = stack_context.wrap(callback)
-        if property:
+        if prior:
             self._queue.appendleft((request, cb))
         else:
             self._queue.append((request, cb))
