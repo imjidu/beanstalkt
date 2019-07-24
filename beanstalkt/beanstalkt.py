@@ -1,5 +1,8 @@
 #!/usr/bin/env python
 """beanstalkt - An async beanstalkd client for Tornado"""
+from functools import partial
+
+from tornado.concurrent import future_set_exc_info, future_set_result_unless_cancelled, Future
 
 __license__ = """
 Copyright (C) 2012-2014 Nephics AB
@@ -63,6 +66,7 @@ class CommandFailed(BeanstalkException): pass
 class Buried(BeanstalkException): pass
 class DeadlineSoon(BeanstalkException): pass
 class TimedOut(BeanstalkException): pass
+class ClientClosed(BeanstalkException): pass
 
 
 class Client(object):
@@ -76,11 +80,17 @@ class Client(object):
         self._stream = None
         self._using = 'default'  # current tube
         self._watching = set(['default'])   # set of watched tubes
-        self._queue = deque()
+        self._queue = None
         self._talking = False
         self._reconnect_cb = None
+        self._ready = False
 
     def _reconnect(self):
+        self._ready = False
+        for _, future in self._queue:
+            future.set_exception(ClientClosed())
+        self._queue = None
+
         logger.debug('Reconnect in %f second(s)', RECONNECT_TIMEOUT)
 
         def cb(future):
@@ -93,6 +103,7 @@ class Client(object):
                                      self.connect(), cb))
 
     def _reconnected(self):
+        self._ready = True
         logger.debug('Reconnected, restoring connection state...')
 
         # re-establish the used tube and tubes being watched
@@ -102,9 +113,11 @@ class Client(object):
 
         futures = []
         if watch:
-            futures.append(self.watch(watch.pop()))
+            while watch:
+                futures.append(self.watch(watch.pop()))
         if ignore:
-            futures.append(self.ignore(ignore.pop()))
+            while ignore:
+                futures.append(self.ignore(ignore.pop()))
         if self._using != 'default':
             futures.append(self.use(self._using))
 
@@ -117,14 +130,16 @@ class Client(object):
             future = multi(futures)
             self.io_loop.add_future(future, do_next)
         else:
+            self._ready = True
             self.io_loop.add_callback(self._process_queue)
 
     @coroutine
     def connect(self):
         """Connect to beanstalkd server."""
-        if not self.closed():
+        if self._stream and not self._stream.closed():
             return
         self._talking = False
+        self._queue = deque()
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM,
                 socket.IPPROTO_TCP)
         if tornado_version >= '5.0':
@@ -132,7 +147,8 @@ class Client(object):
         else:
             self._stream = IOStream(self._socket, io_loop=self.io_loop)
         self._stream.set_close_callback(self._reconnect)
-        yield Task(self._stream.connect, (self.host, self.port))
+        yield self._stream.connect((self.host, self.port))
+        self._ready = True
 
     def set_reconnect_callback(self, callback):
         """Set callback to be called if connection has been lost and
@@ -157,24 +173,34 @@ class Client(object):
 
     def closed(self):
         """"Returns True if the connection is closed."""
-        return not self._stream or self._stream.closed()
+        return not self._stream or self._stream.closed() or not self._ready
 
-    def _interact(self, request, callback, prior=False):
+    def _interact(self, request):
+        if self.closed():
+            raise AssertionError('operate on closed client')
+        future = Future()
         # put the interaction request into the FIFO queue
-        cb = stack_context.wrap(callback)
-        if prior:
-            self._queue.appendleft((request, cb))
-        else:
-            self._queue.append((request, cb))
+        self._queue.append((request, future))
         self.io_loop.spawn_callback(self._process_queue)
+        return future
 
     def _process_queue(self):
         if self._talking or not self._queue:
             return
         # pop a request of the queue and perform the send-receive interaction
+        req, future = self._queue[0]
+
+        def handle_exception(typ, value, tb):
+            if future.done():
+              return False
+            future_set_exc_info(future, (typ, value, tb))
+            self._talking = False
+            self._queue.popleft()
+            self.io_loop.add_callback(self._process_queue)
+            return True
+
         self._talking = True
-        with stack_context.NullContext():
-            req, cb = self._queue[0]
+        with stack_context.ExceptionStackContext(handle_exception):
             command = req.cmd + b'\r\n'
             if req.body:
                 command += req.body + b'\r\n'
@@ -183,7 +209,7 @@ class Client(object):
             # return status and results
             def read_cb(data):
                 logger.debug('Read response: %r', data)
-                self._recv(req, data, cb)
+                self._recv(req, data, future)
                 self.io_loop.add_callback(self._process_queue)
 
             # when command is written: read line from socket stream
@@ -194,7 +220,7 @@ class Client(object):
             logger.debug('Write command: %r', command)
             self._stream.write(command, write_cb)
 
-    def _recv(self, req, data, cb):
+    def _recv(self, req, data, future):
         # parse the data received as server response
         spl = data.decode('utf8').split()
         status, values = spl[0], spl[1:]
@@ -220,7 +246,7 @@ class Client(object):
 
         if error or not req.read_body:
             # end the request and callback with results
-            self._do_callback(cb, resp)
+            self._do_callback(future, resp)
         else:
             # read the body including the terminating two bytes of crlf
             if len(values) == 2:
@@ -229,20 +255,20 @@ class Client(object):
             else:
                 size = int(values[0])
             self._stream.read_bytes(size + 2,
-                    lambda data: self._recv_body(data[:-2], resp, cb))
+                    lambda data: self._recv_body(data[:-2], resp, future))
 
-    def _recv_body(self, data, resp, cb):
+    def _recv_body(self, data, resp, future):
         logger.debug('Read body: %r', data)
         if resp.req.parse_yaml:
             # parse the yaml encoded body
-            self._parse_yaml(data, resp, cb)
+            self._parse_yaml(data, resp, future)
         else:
             # don't parse body, it is a job!
             # end the request and callback with results
             resp.body = ObjectDict(id=resp.job_id, body=data)
-            self._do_callback(cb, resp)
+            self._do_callback(future, resp)
 
-    def _parse_yaml(self, data, resp, cb):
+    def _parse_yaml(self, data, resp, future):
         # dirty parsing of yaml data
         # (assumes that data is a yaml encoded list or dict)
         spl = data.decode('utf8').split('\n')[1:-1]
@@ -255,16 +281,16 @@ class Client(object):
                 if v.replace('.', '', 1).isdigit() else v)
             resp.body = ObjectDict((k, conv(v.strip())) for k, v in
                     (s.split(':') for s in spl))
-        self._do_callback(cb, resp)
+        self._do_callback(future, resp)
 
-    def _do_callback(self, cb, resp):
+    def _do_callback(self, future, resp):
         # end the request and process next item in the queue
         # and callback with results
         self._queue.popleft()
         self._talking = False
         self.io_loop.add_callback(self._process_queue)
 
-        if not cb:
+        if not future:
             return
 
         # default is to callback with error state (None or exception)
@@ -285,13 +311,12 @@ class Client(object):
             # callback with the body (job or parsed yaml)
             obj = resp.body
 
-        self.io_loop.add_callback(lambda: cb(obj))
+        future_set_result_unless_cancelled(future, obj)
 
     #
     #  Producer commands
     #
 
-    @coroutine
     def put(self, body, priority=DEFAULT_PRIORITY, delay=0, ttr=120):
         """Put a job body (a byte string) into the current tube.
 
@@ -311,8 +336,7 @@ class Client(object):
         assert isinstance(body, bytes)
         request = Bunch(cmd=cmd, ok=['INSERTED'], err=['BURIED', 'JOB_TOO_BIG',
                 'DRAINING'], body=body, read_value=True)
-        resp = yield Task(self._interact, request)
-        raise Return(resp)
+        return self._interact(request)
 
     @coroutine
     def use(self, name):
@@ -323,7 +347,7 @@ class Client(object):
         cmd = 'use {}'.format(name).encode('utf8')
         request = Bunch(cmd=cmd, ok=['USING'],
                 read_value=True)
-        resp = yield Task(self._interact, request, prior=True)
+        resp = yield self._interact(request)
         if not isinstance(resp, Exception):
             self._using = resp
         raise Return(resp)
@@ -332,7 +356,6 @@ class Client(object):
     #  Worker commands
     #
 
-    @coroutine
     def reserve(self, timeout=None):
         """Reserve a job from one of the watched tubes, with optional timeout
         in seconds.
@@ -358,10 +381,8 @@ class Client(object):
             cmd = b'reserve'
         request = Bunch(cmd=cmd, ok=['RESERVED'], err=['DEADLINE_SOON',
                 'TIMED_OUT'], read_body=True)
-        resp = yield Task(self._interact, request)
-        raise Return(resp)
+        return self._interact(request)
 
-    @coroutine
     def delete(self, job_id):
         """Delete job with given id.
 
@@ -371,10 +392,8 @@ class Client(object):
         """
         cmd = 'delete {}'.format(job_id).encode('utf8')
         request = Bunch(cmd=cmd, ok=['DELETED'], err=['NOT_FOUND'])
-        resp = yield Task(self._interact, request)
-        raise Return(resp)
+        return self._interact(request)
 
-    @coroutine
     def release(self, job_id, priority=DEFAULT_PRIORITY, delay=0):
         """Release a reserved job back into the ready queue.
 
@@ -390,10 +409,8 @@ class Client(object):
         """
         cmd = 'release {} {} {}'.format(job_id, priority, delay).encode('utf8')
         request = Bunch(cmd=cmd, ok=['RELEASED'], err=['BURIED', 'NOT_FOUND'])
-        resp = yield Task(self._interact, request)
-        raise Return(resp)
+        return self._interact(request)
 
-    @coroutine
     def bury(self, job_id, priority=DEFAULT_PRIORITY):
         """Bury job with given id.
 
@@ -404,10 +421,8 @@ class Client(object):
         """
         cmd = 'bury {} {}'.format(job_id, priority).encode('utf8')
         request = Bunch(cmd=cmd, ok=['BURIED'], err=['NOT_FOUND'])
-        resp = yield Task(self._interact, request)
-        raise Return(resp)
+        return self._interact(request)
 
-    @coroutine
     def touch(self, job_id):
         """Touch job with given id.
 
@@ -419,8 +434,7 @@ class Client(object):
         """
         cmd = 'touch {}'.format(job_id).encode('utf8')
         request = Bunch(cmd=cmd, ok=['TOUCHED'], err=['NOT_FOUND'])
-        resp = yield Task(self._interact, request)
-        raise Return(resp)
+        return self._interact(request)
 
     @coroutine
     def watch(self, name):
@@ -430,7 +444,7 @@ class Client(object):
         """
         cmd = 'watch {}'.format(name).encode('utf8')
         request = Bunch(cmd=cmd, ok=['WATCHING'], read_value=True)
-        resp = yield Task(self._interact, request, prior=True)
+        resp = yield self._interact(request)
         # add to the client's watch list
         self._watching.add(name)
         raise Return(resp)
@@ -446,7 +460,7 @@ class Client(object):
         cmd = 'ignore {}'.format(name).encode('utf8')
         request = Bunch(cmd=cmd, ok=['WATCHING'], err=['NOT_IGNORED'],
                 read_value=True)
-        resp = yield Task(self._interact, request, prior=True)
+        resp = yield self._interact(request)
         if name in self._watching:
             # remove from the client's watch list
             self._watching.remove(name)
@@ -456,54 +470,45 @@ class Client(object):
     #  Other commands
     #
 
-    def _peek(self, variant, callback):
+    def _peek(self, variant):
         # a shared gateway for the peek* commands
         cmd = 'peek{}'.format(variant).encode('utf8')
         request = Bunch(cmd=cmd, ok=['FOUND'], err=['NOT_FOUND'],
                 read_body=True)
-        self._interact(request, callback)
+        self._interact(request)
 
-    @coroutine
     def peek(self, job_id):
         """Peek at job with given id.
 
         Calls back with a job dict (keys id and body). If no job exists with
         that id, the callback gets a CommandFailed exception.
         """
-        resp = yield Task(self._peek, ' {}'.format(job_id))
-        raise Return(resp)
+        return self._peek(' {}'.format(job_id))
 
-    @coroutine
     def peek_ready(self):
         """Peek at next ready job in the current tube.
 
         Calls back with a job dict (keys id and body). If no ready jobs exist,
         the callback gets a CommandFailed exception.
         """
-        resp = yield Task(self._peek, '-ready')
-        raise Return(resp)
+        return self._peek('-ready')
 
-    @coroutine
     def peek_delayed(self):
         """Peek at next delayed job in the current tube.
 
         Calls back with a job dict (keys id and body). If no delayed jobs exist,
         the callback gets a CommandFailed exception.
         """
-        resp = yield Task(self._peek, '-delayed')
-        raise Return(resp)
+        return self._peek('-delayed')
 
-    @coroutine
     def peek_buried(self):
         """Peek at next buried job in the current tube.
 
         Calls back with a job dict (keys id and body). If no buried jobs exist,
         the callback gets a CommandFailed exception.
         """
-        resp = yield Task(self._peek, '-buried')
-        raise Return(resp)
+        return self._peek('-buried')
 
-    @coroutine
     def kick(self, bound=1):
         """Kick at most `bound` jobs into the ready queue from the current tube.
 
@@ -511,10 +516,8 @@ class Client(object):
         """
         cmd = 'kick {}'.format(bound).encode('utf8')
         request = Bunch(cmd=cmd, ok=['KICKED'], read_value=True)
-        resp = yield Task(self._interact, request)
-        raise Return(resp)
+        return self._interact(request)
 
-    @coroutine
     def kick_job(self, job_id):
         """Kick job with given id into the ready queue.
         (Requires Beanstalkd version >= 1.8)
@@ -525,10 +528,8 @@ class Client(object):
         """
         cmd = 'kick-job {}'.format(job_id).encode('utf8')
         request = Bunch(cmd=cmd, ok=['KICKED'], err=['NOT_FOUND'])
-        resp = yield Task(self._interact, request)
-        raise Return(resp)
+        return self._interact(request)
 
-    @coroutine
     def stats_job(self, job_id):
         """A dict of stats about the job with given id.
 
@@ -538,10 +539,8 @@ class Client(object):
         cmd = 'stats-job {}'.format(job_id).encode('utf8')
         request = Bunch(cmd=cmd, ok=['OK'], err=['NOT_FOUND'], read_body=True,
                 parse_yaml=True)
-        resp = yield Task(self._interact, request)
-        raise Return(resp)
+        return self._interact(request)
 
-    @coroutine
     def stats_tube(self, name):
         """A dict of stats about the tube with given name.
 
@@ -551,41 +550,31 @@ class Client(object):
         cmd = 'stats-tube {}'.format(name).encode('utf8')
         request = Bunch(cmd=cmd, ok=['OK'], err=['NOT_FOUND'], read_body=True,
                 parse_yaml=True)
-        resp = yield Task(self._interact, request)
-        raise Return(resp)
+        return self._interact(request)
 
-    @coroutine
     def stats(self):
         """A dict of beanstalkd statistics."""
         request = Bunch(cmd=b'stats', ok=['OK'], read_body=True,
                 parse_yaml=True)
-        resp = yield Task(self._interact, request)
-        raise Return(resp)
+        return self._interact(request)
 
-    @coroutine
     def list_tubes(self):
         """List of all existing tubes."""
         request = Bunch(cmd=b'list-tubes', ok=['OK'], read_body=True,
                 parse_yaml=True)
-        resp = yield Task(self._interact, request)
-        raise Return(resp)
+        return self._interact(request)
 
-    @coroutine
     def list_tube_used(self):
         """Name of the tube currently being used."""
         request = Bunch(cmd=b'list-tube-used', ok=['USING'], read_value=True)
-        resp = yield Task(self._interact, request)
-        raise Return(resp)
+        return self._interact(request)
 
-    @coroutine
     def list_tubes_watched(self):
         """List of tubes currently being watched."""
         request = Bunch(cmd=b'list-tubes-watched', ok=['OK'], read_body=True,
                 parse_yaml=True)
-        resp = yield Task(self._interact, request)
-        raise Return(resp)
+        return self._interact(request)
 
-    @coroutine
     def pause_tube(self, name, delay):
         """Delay any new job being reserved from the tube for a given time.
 
@@ -597,5 +586,4 @@ class Client(object):
         """
         cmd = 'pause-tube {} {}'.format(name, delay).encode('utf8')
         request = Bunch(cmd=cmd, ok=['PAUSED'], err=['NOT_FOUND'])
-        resp = yield Task(self._interact, request)
-        raise Return(resp)
+        return self._interact(request)
